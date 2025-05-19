@@ -1,4 +1,4 @@
-use log::{error, info, LevelFilter};
+use once_cell::sync::OnceCell;
 use russh::keys::ssh_key::rand_core::OsRng;
 use russh::server::{Auth, Msg, Server as _, Session};
 use russh::{Channel, ChannelId};
@@ -8,6 +8,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
 
 #[derive(Clone)]
 struct Server;
@@ -168,11 +170,22 @@ impl russh_sftp::server::Handler for SftpSession {
     }
 }
 
+static TRACING: OnceCell<()> = OnceCell::new();
+
+fn init_tracing() {
+    TRACING.get_or_init(|| {
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
+
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_test_writer()
+            .init();
+    });
+}
+
 #[tokio::main]
 async fn main() {
-    env_logger::builder()
-        .filter_level(LevelFilter::Debug)
-        .init();
+    init_tracing();
 
     let config = russh::server::Config {
         auth_rejection_time: Duration::from_secs(3),

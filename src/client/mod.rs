@@ -15,6 +15,7 @@ use tokio::{
     sync::mpsc,
 };
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, warn};
 
 use crate::{error::Error, protocol::Packet, utils::read_packet};
 
@@ -73,7 +74,7 @@ where
                     result = process_handler(&mut rd, &mut handler) => {
                         match result {
                             Err(Error::UnexpectedEof) => break,
-                            Err(err) => warn!("{}", err),
+                            Err(err) => warn!("Error processing handler: {:?}", err),
                             Ok(_) => (),
                         }
                     },
@@ -82,6 +83,7 @@ where
             }
 
             rc.cancel();
+
             debug!("read half of sftp stream ended");
         });
     }

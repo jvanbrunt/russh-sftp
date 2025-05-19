@@ -28,6 +28,7 @@ mod version;
 mod write;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use tracing::debug;
 
 use crate::{de, error::Error, ser};
 

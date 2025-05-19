@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use log::debug;
+
 use russh::{client, ChannelId};
 use russh_sftp::client::SftpSession;
 use std::sync::Arc;
@@ -8,6 +8,7 @@ use tokio::{
     task::{self},
     time::Instant,
 };
+use tracing::debug;
 struct Client;
 
 impl client::Handler for Client {

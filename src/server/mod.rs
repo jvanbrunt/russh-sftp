@@ -2,6 +2,7 @@ mod handler;
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tracing::{debug, warn};
 
 pub use self::handler::Handler;
 
@@ -80,7 +81,7 @@ where
         loop {
             match process_handler(&mut stream, &mut handler).await {
                 Err(Error::UnexpectedEof) => break,
-                Err(err) => warn!("{}", err),
+                Err(err) => warn!("Error processing handler: {:?}", err),
                 Ok(_) => (),
             }
         }

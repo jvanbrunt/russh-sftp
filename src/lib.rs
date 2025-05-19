@@ -15,8 +15,6 @@
 //! You can find more examples in the repository.
 
 #[macro_use]
-extern crate log;
-#[macro_use]
 extern crate bitflags;
 #[macro_use]
 extern crate serde;
