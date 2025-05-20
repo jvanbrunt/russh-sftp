@@ -154,10 +154,15 @@ impl SftpSession {
 
     /// Reads the contents of a file located at the specified path to the end.
     pub async fn read<P: Into<String>>(&self, path: P) -> SftpResult<Vec<u8>> {
-        let mut file = self.open(path).await?;
+        let path_str = path.into();
+        let mut file = self.open(&path_str).await?;
         let mut buffer = Vec::new();
 
-        file.read_to_end(&mut buffer).await?;
+        file.read_to_end(&mut buffer).await.map_err(|err| {
+            tracing::error!(err = ?err, path = ?path_str,
+                "Failed to read file");
+            err
+        })?;
 
         Ok(buffer)
     }

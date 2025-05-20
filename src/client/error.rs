@@ -38,6 +38,8 @@ impl From<Status> for Error {
 
 impl From<io::Error> for Error {
     fn from(error: io::Error) -> Self {
+        tracing::error!(err = ?error, "I/O error");
+
         Self::IO(error.to_string())
     }
 }
