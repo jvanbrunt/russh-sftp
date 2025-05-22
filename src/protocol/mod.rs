@@ -28,7 +28,7 @@ mod version;
 mod write;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use tracing::debug;
+use tracing::{debug, trace, warn};
 
 use crate::{de, error::Error, ser};
 
@@ -155,6 +155,40 @@ pub enum Packet {
     ExtendedReply(ExtendedReply),
 }
 
+/// Convert a packet type number to a human-readable string
+fn packet_type_to_string(r#type: u8) -> &'static str {
+    match r#type {
+        SSH_FXP_INIT => "SSH_FXP_INIT",
+        SSH_FXP_VERSION => "SSH_FXP_VERSION",
+        SSH_FXP_OPEN => "SSH_FXP_OPEN",
+        SSH_FXP_CLOSE => "SSH_FXP_CLOSE",
+        SSH_FXP_READ => "SSH_FXP_READ",
+        SSH_FXP_WRITE => "SSH_FXP_WRITE",
+        SSH_FXP_LSTAT => "SSH_FXP_LSTAT",
+        SSH_FXP_FSTAT => "SSH_FXP_FSTAT",
+        SSH_FXP_SETSTAT => "SSH_FXP_SETSTAT",
+        SSH_FXP_FSETSTAT => "SSH_FXP_FSETSTAT",
+        SSH_FXP_OPENDIR => "SSH_FXP_OPENDIR",
+        SSH_FXP_READDIR => "SSH_FXP_READDIR",
+        SSH_FXP_REMOVE => "SSH_FXP_REMOVE",
+        SSH_FXP_MKDIR => "SSH_FXP_MKDIR",
+        SSH_FXP_RMDIR => "SSH_FXP_RMDIR",
+        SSH_FXP_REALPATH => "SSH_FXP_REALPATH",
+        SSH_FXP_STAT => "SSH_FXP_STAT",
+        SSH_FXP_RENAME => "SSH_FXP_RENAME",
+        SSH_FXP_READLINK => "SSH_FXP_READLINK",
+        SSH_FXP_SYMLINK => "SSH_FXP_SYMLINK",
+        SSH_FXP_STATUS => "SSH_FXP_STATUS",
+        SSH_FXP_HANDLE => "SSH_FXP_HANDLE",
+        SSH_FXP_DATA => "SSH_FXP_DATA",
+        SSH_FXP_NAME => "SSH_FXP_NAME",
+        SSH_FXP_ATTRS => "SSH_FXP_ATTRS",
+        SSH_FXP_EXTENDED => "SSH_FXP_EXTENDED",
+        SSH_FXP_EXTENDED_REPLY => "SSH_FXP_EXTENDED_REPLY",
+        _ => "UNKNOWN",
+    }
+}
+
 impl Packet {
     pub fn get_request_id(&self) -> u32 {
         match self {
@@ -180,6 +214,39 @@ impl Packet {
             _ => 0,
         }
     }
+    
+    /// Returns a string representation of the packet type for logging purposes
+    pub fn packet_type(&self) -> &'static str {
+        match self {
+            Self::Init(_) => "SSH_FXP_INIT",
+            Self::Version(_) => "SSH_FXP_VERSION",
+            Self::Open(_) => "SSH_FXP_OPEN",
+            Self::Close(_) => "SSH_FXP_CLOSE",
+            Self::Read(_) => "SSH_FXP_READ",
+            Self::Write(_) => "SSH_FXP_WRITE",
+            Self::Lstat(_) => "SSH_FXP_LSTAT",
+            Self::Fstat(_) => "SSH_FXP_FSTAT",
+            Self::SetStat(_) => "SSH_FXP_SETSTAT",
+            Self::FSetStat(_) => "SSH_FXP_FSETSTAT",
+            Self::OpenDir(_) => "SSH_FXP_OPENDIR",
+            Self::ReadDir(_) => "SSH_FXP_READDIR",
+            Self::Remove(_) => "SSH_FXP_REMOVE",
+            Self::MkDir(_) => "SSH_FXP_MKDIR",
+            Self::RmDir(_) => "SSH_FXP_RMDIR",
+            Self::RealPath(_) => "SSH_FXP_REALPATH",
+            Self::Stat(_) => "SSH_FXP_STAT",
+            Self::Rename(_) => "SSH_FXP_RENAME",
+            Self::ReadLink(_) => "SSH_FXP_READLINK",
+            Self::Symlink(_) => "SSH_FXP_SYMLINK",
+            Self::Status(_) => "SSH_FXP_STATUS",
+            Self::Handle(_) => "SSH_FXP_HANDLE",
+            Self::Data(_) => "SSH_FXP_DATA",
+            Self::Name(_) => "SSH_FXP_NAME",
+            Self::Attrs(_) => "SSH_FXP_ATTRS",
+            Self::Extended(_) => "SSH_FXP_EXTENDED",
+            Self::ExtendedReply(_) => "SSH_FXP_EXTENDED_REPLY",
+        }
+    }
 
     pub fn status(id: u32, status_code: StatusCode, msg: &str, tag: &str) -> Self {
         Packet::Status(Status {
@@ -200,7 +267,8 @@ impl TryFrom<&mut Bytes> for Packet {
 
     fn try_from(bytes: &mut Bytes) -> Result<Self, Self::Error> {
         let r#type = bytes.try_get_u8()?;
-        debug!("packet type {}", r#type);
+        let packet_type_name = packet_type_to_string(r#type);
+        debug!(packet_type = r#type, packet_name = %packet_type_name, remaining_bytes = bytes.len(), "Parsing packet");
 
         let request = match r#type {
             SSH_FXP_INIT => Self::Init(de::from_bytes(bytes)?),
@@ -230,7 +298,10 @@ impl TryFrom<&mut Bytes> for Packet {
             SSH_FXP_ATTRS => Self::Attrs(de::from_bytes(bytes)?),
             SSH_FXP_EXTENDED => Self::Extended(de::from_bytes(bytes)?),
             SSH_FXP_EXTENDED_REPLY => Self::ExtendedReply(de::from_bytes(bytes)?),
-            _ => return Err(Error::BadMessage("unknown type".to_owned())),
+            _ => {
+                warn!(packet_type = r#type, "Unknown packet type");
+                return Err(Error::BadMessage(format!("unknown packet type: {}", r#type)));
+            },
         };
 
         Ok(request)
@@ -242,6 +313,7 @@ impl TryFrom<Packet> for Bytes {
 
     fn try_from(packet: Packet) -> Result<Self, Self::Error> {
         let (r#type, payload): (u8, Bytes) = match packet {
+
             Packet::Init(init) => (SSH_FXP_INIT, ser::to_bytes(&init)?),
             Packet::Version(version) => (SSH_FXP_VERSION, ser::to_bytes(&version)?),
             Packet::Open(open) => (SSH_FXP_OPEN, ser::to_bytes(&open)?),
@@ -272,6 +344,9 @@ impl TryFrom<Packet> for Bytes {
         };
 
         let length = payload.len() as u32 + 1;
+        let packet_type_name = packet_type_to_string(r#type);
+        trace!(packet_type = r#type, packet_name = %packet_type_name, payload_size = payload.len(), total_size = length, "Serializing packet");
+        
         let mut bytes = BytesMut::new();
         bytes.put_u32(length);
         bytes.put_u8(r#type);

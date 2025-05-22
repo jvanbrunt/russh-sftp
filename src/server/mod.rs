@@ -2,7 +2,7 @@ mod handler;
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tracing::{debug, warn};
+use tracing::{debug, error, info, trace, warn};
 
 pub use self::handler::Handler;
 
@@ -26,6 +26,7 @@ where
     H: Handler + Send,
 {
     let id = packet.get_request_id();
+    debug!(request_id = id, packet_type = ?packet, "Processing SFTP request");
 
     match packet {
         Packet::Init(init) => into_wrap!(id, handler, init; version, extensions),
@@ -57,16 +58,38 @@ where
     H: Handler + Send,
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    trace!("Reading SFTP packet from stream");
     let mut bytes = read_packet(stream).await?;
 
     let response = match Packet::try_from(&mut bytes) {
         Ok(request) => process_request(request, handler).await,
-        Err(_) => Packet::error(0, StatusCode::BadMessage),
+        Err(e) => {
+            error!(error = ?e, "Failed to parse SFTP packet");
+            Packet::error(0, StatusCode::BadMessage)
+        },
     };
 
-    let packet = Bytes::try_from(response)?;
-    stream.write_all(&packet).await?;
-    stream.flush().await?;
+    trace!(response_type = ?response, "Sending SFTP response");
+    let packet = match Bytes::try_from(response) {
+        Ok(p) => p,
+        Err(e) => {
+            error!(error = ?e, "Failed to serialize SFTP response");
+            return Err(e);
+        }
+    };
+    
+    match stream.write_all(&packet).await {
+        Ok(_) => trace!(bytes_written = packet.len(), "Wrote response to stream"),
+        Err(e) => {
+            error!(error = ?e, "Failed to write SFTP response to stream");
+            return Err(e.into());
+        }
+    }
+    
+    if let Err(e) = stream.flush().await {
+        error!(error = ?e, "Failed to flush stream");
+        return Err(e.into());
+    }
 
     Ok(())
 }
@@ -77,15 +100,21 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: Handler + Send + 'static,
 {
+    info!("Starting SFTP server handler");
     tokio::spawn(async move {
         loop {
             match process_handler(&mut stream, &mut handler).await {
-                Err(Error::UnexpectedEof) => break,
-                Err(err) => warn!("Error processing handler: {:?}", err),
-                Ok(_) => (),
+                Err(Error::UnexpectedEof) => {
+                    info!("SFTP connection closed by client (EOF)");
+                    break;
+                },
+                Err(err) => {
+                    warn!(error = ?err, "Error processing SFTP request");
+                },
+                Ok(_) => trace!("Successfully processed SFTP request"),
             }
         }
 
-        debug!("sftp stream ended");
+        debug!("SFTP server stream ended");
     });
 }

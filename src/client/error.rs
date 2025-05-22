@@ -38,7 +38,7 @@ impl From<Status> for Error {
 
 impl From<io::Error> for Error {
     fn from(error: io::Error) -> Self {
-        tracing::error!(err = ?error, "I/O error");
+        tracing::error!(err = ?error, error_kind = ?error.kind(), "I/O error in SFTP client");
 
         Self::IO(error.to_string())
     }
@@ -46,24 +46,28 @@ impl From<io::Error> for Error {
 
 impl<T> From<MpscSendError<T>> for Error {
     fn from(err: MpscSendError<T>) -> Self {
+        tracing::error!(error = ?err, "MPSC channel send error in SFTP client");
         Self::UnexpectedBehavior(format!("SendError: {}", err))
     }
 }
 
 impl From<OneshotRecvError> for Error {
     fn from(err: OneshotRecvError) -> Self {
+        tracing::error!(error = ?err, "Oneshot channel receive error in SFTP client");
         Self::UnexpectedBehavior(format!("RecvError: {}", err))
     }
 }
 
 impl From<TimeElapsed> for Error {
-    fn from(_: TimeElapsed) -> Self {
+    fn from(elapsed: TimeElapsed) -> Self {
+        tracing::warn!(error = ?elapsed, "Timeout in SFTP client operation");
         Self::Timeout
     }
 }
 
 impl From<error::Error> for Error {
     fn from(error: error::Error) -> Self {
+        tracing::error!(error = ?error, error_message = %error.to_string(), "Core SFTP error converted to client error");
         Self::UnexpectedBehavior(error.to_string())
     }
 }

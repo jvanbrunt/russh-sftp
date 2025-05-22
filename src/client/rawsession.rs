@@ -12,7 +12,7 @@ use tokio::{
     sync::{mpsc, RwLock},
     time,
 };
-use tracing::warn;
+use tracing::{debug, error, info, trace, warn};
 
 use super::{error::Error, run, Handler};
 use crate::{
@@ -37,22 +37,34 @@ pub(crate) struct SessionInner {
 
 impl SessionInner {
     pub async fn reply(&mut self, id: Option<u32>, packet: Packet) -> SftpResult<()> {
+        trace!(packet_id = ?id, packet_type = ?packet.packet_type(), "Received packet");
+        
         if let Some(sender) = self.requests.pin().remove(&id) {
             let validate = if id.is_some() && self.version.is_none() {
+                warn!(packet_id = ?id, "Unexpected packet: received ID when version is none");
                 Err(Error::UnexpectedPacket)
             } else if id.is_none() && self.version.is_some() {
+                warn!("Unexpected behavior: duplicate version");
                 Err(Error::UnexpectedBehavior("Duplicate version".to_owned()))
             } else {
+                trace!(packet_id = ?id, "Packet validation successful");
                 Ok(())
             };
 
-            sender
-                .try_send(validate.clone().map(|_| packet))
-                .map_err(|e| Error::UnexpectedBehavior(e.to_string()))?;
+            match sender.try_send(validate.clone().map(|_| packet)) {
+                Ok(_) => {
+                    debug!(packet_id = ?id, "Successfully processed packet");
+                }
+                Err(e) => {
+                    error!(packet_id = ?id, error = %e, "Failed to send packet to recipient");
+                    return Err(Error::UnexpectedBehavior(e.to_string()));
+                }
+            }
 
             return validate;
         }
 
+        error!(packet_id = ?id, "Packet for unknown recipient");
         Err(Error::UnexpectedBehavior(format!(
             "Packet {:?} for unknown recipient",
             id
@@ -199,24 +211,39 @@ impl RawSftpSession {
     }
 
     async fn send(&self, id: Option<u32>, packet: Packet) -> SftpResult<Packet> {
+        debug!(request_id = ?id, packet_type = ?packet.packet_type(), "Sending packet");
+        
         if self.tx.is_closed() {
+            error!("Cannot send packet: session closed");
             return Err(Error::UnexpectedBehavior("session closed".into()));
         }
 
         let (tx, mut rx) = mpsc::channel(1);
 
         self.requests.pin().insert(id, tx);
-        self.tx.send(Bytes::try_from(packet)?)?;
+        match self.tx.send(Bytes::try_from(packet)?) {
+            Ok(_) => trace!(request_id = ?id, "Packet successfully queued for sending"),
+            Err(e) => {
+                error!(request_id = ?id, error = ?e, "Failed to send packet");
+                return Err(e.into());
+            }
+        }
 
         let timeout = *self.options.timeout.read().await;
+        trace!(request_id = ?id, timeout_secs = timeout, "Waiting for response");
 
         match time::timeout(Duration::from_secs(timeout), rx.recv()).await {
-            Ok(Some(result)) => result,
+            Ok(Some(result)) => {
+                trace!(request_id = ?id, response_type = ?result.as_ref().map(|p| p.packet_type()), "Response received");
+                result
+            },
             Ok(None) => {
+                warn!(request_id = ?id, "Received None message instead of packet");
                 self.requests.pin().remove(&id);
                 Err(Error::UnexpectedBehavior("recv none message".into()))
             }
             Err(error) => {
+                warn!(request_id = ?id, error = ?error, "Request timed out");
                 self.requests.pin().remove(&id);
                 Err(error.into())
             }
@@ -229,18 +256,35 @@ impl RawSftpSession {
 
     /// Closes the inner channel stream. Called by [`Drop`]
     pub fn close_session(&self) -> SftpResult<()> {
+        debug!("Closing SFTP session");
+        
         if self.tx.is_closed() {
+            trace!("Session already closed");
             return Ok(());
         }
 
-        Ok(self.tx.send(Bytes::new())?)
+        match self.tx.send(Bytes::new()) {
+            Ok(_) => {
+                info!("SFTP session closed successfully");
+                Ok(())
+            }
+            Err(e) => {
+                error!(error = ?e, "Failed to close SFTP session");
+                Err(e.into())
+            }
+        }
     }
 
     pub async fn init(&self) -> SftpResult<Version> {
+        debug!("Initializing SFTP session");
+        
         let result = self.send(None, Init::default().into()).await?;
+        
         if let Packet::Version(version) = result {
+            info!(sftp_version = version.version, "SFTP session initialized successfully");
             Ok(version)
         } else {
+            error!(actual_packet = ?result.packet_type(), "Unexpected packet received during initialization");
             Err(Error::UnexpectedPacket)
         }
     }
@@ -251,12 +295,20 @@ impl RawSftpSession {
         flags: OpenFlags,
         attrs: FileAttributes,
     ) -> SftpResult<Handle> {
+        let filename_str = filename.into();
+        debug!(request_id = ?self.next_req_id.load(Ordering::SeqCst), filename = %filename_str, flags = ?flags, "Opening file");
+        
         if self
             .options
             .limits
             .open_handles
             .is_some_and(|h| self.handles.load(Ordering::SeqCst) >= h)
         {
+            warn!(
+                current_handles = self.handles.load(Ordering::SeqCst),
+                max_handles = ?self.options.limits.open_handles,
+                "Handle limit reached"
+            );
             return Err(Error::Limited("handle limit reached".to_owned()));
         }
 
@@ -266,7 +318,7 @@ impl RawSftpSession {
                 Some(id),
                 Open {
                     id,
-                    filename: filename.into(),
+                    filename: filename_str,
                     pflags: flags,
                     attrs,
                 }
@@ -275,28 +327,32 @@ impl RawSftpSession {
             .await?;
 
         if let Packet::Handle(_) = result {
-            self.handles.fetch_add(1, Ordering::SeqCst);
+            let new_handle_count = self.handles.fetch_add(1, Ordering::SeqCst) + 1;
+            debug!(request_id = id, handle_count = new_handle_count, "File opened successfully");
         }
 
         into_with_status!(result, Handle)
     }
 
     pub async fn close<H: Into<String>>(&self, handle: H) -> SftpResult<Status> {
+        let handle_str = handle.into();
+        debug!(handle = %handle_str, "Closing handle");
+        
         let id = self.use_next_id();
         let result = self
             .send(
                 Some(id),
                 Close {
                     id,
-                    handle: handle.into(),
+                    handle: handle_str,
                 }
                 .into(),
             )
             .await?;
 
         if let Packet::Status(status) = &result {
-            if status.status_code == StatusCode::Ok
-                && self
+            if status.status_code == StatusCode::Ok {
+                let update_result = self
                     .handles
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |h| {
                         if h > 0 {
@@ -304,10 +360,16 @@ impl RawSftpSession {
                         } else {
                             None
                         }
-                    })
-                    .is_err()
-            {
-                warn!("attempt to close more handles than exist");
+                    });
+                
+                if update_result.is_err() {
+                    warn!(request_id = id, "Attempt to close more handles than exist");
+                } else {
+                    let remaining_handles = self.handles.load(Ordering::SeqCst);
+                    debug!(request_id = id, remaining_handles = remaining_handles, "Handle closed successfully");
+                }
+            } else {
+                warn!(request_id = id, status_code = ?status.status_code, error = %status.error_message, "Failed to close handle");
             }
         }
 
@@ -320,7 +382,15 @@ impl RawSftpSession {
         offset: u64,
         len: u32,
     ) -> SftpResult<Data> {
+        let handle_str = handle.into();
+        debug!(handle = %handle_str, offset = offset, length = len, "Reading from file");
+        
         if self.options.limits.read_len.is_some_and(|r| len as u64 > r) {
+            warn!(
+                requested_length = len,
+                max_length = ?self.options.limits.read_len,
+                "Read limit exceeded"
+            );
             return Err(Error::Limited("read limit reached".to_owned()));
         }
 
@@ -330,13 +400,25 @@ impl RawSftpSession {
                 Some(id),
                 Read {
                     id,
-                    handle: handle.into(),
+                    handle: handle_str,
                     offset,
                     len,
                 }
                 .into(),
             )
             .await?;
+
+        match &result {
+            Packet::Data(data) => {
+                trace!(request_id = id, data_length = data.data.len(), "Read operation successful");
+            }
+            Packet::Status(status) => {
+                warn!(request_id = id, status_code = ?status.status_code, error = %status.error_message, "Read operation failed");
+            }
+            _ => {
+                error!(request_id = id, packet_type = ?result.packet_type(), "Unexpected packet received for read operation");
+            }
+        }
 
         into_with_status!(result, Data)
     }
@@ -347,12 +429,21 @@ impl RawSftpSession {
         offset: u64,
         data: Vec<u8>,
     ) -> SftpResult<Status> {
+        let handle_str = handle.into();
+        let data_len = data.len();
+        debug!(handle = %handle_str, offset = offset, data_length = data_len, "Writing to file");
+        
         if self
             .options
             .limits
             .write_len
-            .is_some_and(|w| data.len() as u64 > w)
+            .is_some_and(|w| data_len as u64 > w)
         {
+            warn!(
+                requested_length = data_len,
+                max_length = ?self.options.limits.write_len,
+                "Write limit exceeded"
+            );
             return Err(Error::Limited("write limit reached".to_owned()));
         }
 
@@ -362,13 +453,21 @@ impl RawSftpSession {
                 Some(id),
                 Write {
                     id,
-                    handle: handle.into(),
+                    handle: handle_str,
                     offset,
                     data,
                 }
                 .into(),
             )
             .await?;
+
+        if let Packet::Status(status) = &result {
+            if status.status_code == StatusCode::Ok {
+                debug!(request_id = id, bytes_written = data_len, "Write operation successful");
+            } else {
+                warn!(request_id = id, status_code = ?status.status_code, error = %status.error_message, "Write operation failed");
+            }
+        }
 
         into_status!(result)
     }
@@ -719,6 +818,9 @@ impl RawSftpSession {
 
 impl Drop for RawSftpSession {
     fn drop(&mut self) {
-        let _ = self.close_session();
+        trace!("Dropping RawSftpSession, closing session");
+        if let Err(err) = self.close_session() {
+            warn!(error = ?err, "Error during session cleanup in Drop");
+        }
     }
 }

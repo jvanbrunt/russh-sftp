@@ -23,6 +23,49 @@ The main idea of the project is to provide an implementation for interacting wit
 - [ ] Unit tests
 - [ ] Workflow
 
+## Logging and Debugging
+
+The library uses the `tracing` crate for structured logging. Log levels include:
+
+- **ERROR**: Serious issues requiring attention
+- **WARN**: Unusual or unexpected conditions that don't cause failures
+- **INFO**: Important lifecycle events
+- **DEBUG**: Detailed protocol operation information
+- **TRACE**: Low-level packet details and I/O operations
+
+### Configuring Logging
+
+Configure logging levels via the `RUST_LOG` environment variable:
+
+```bash
+# Set logging level for all components
+RUST_LOG=debug cargo run --example client
+
+# Set different levels for different components
+RUST_LOG=russh_sftp=trace,info cargo run --example server
+```
+
+### Structured Logging
+
+Logs include structured fields for easier analysis:
+
+```
+2023-05-22T15:42:09.123Z ERROR russh_sftp::client::error: I/O error in SFTP client {err=Os { code: 2, kind: NotFound, message: "No such file or directory" }}
+```
+
+For applications using this library, you can initialize tracing as shown in the examples:
+
+```rust
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
+    
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)  // Include module paths
+        .init();
+}
+```
+
 ## Adopters
 
 - [kty](https://github.com/grampelberg/kty) - The terminal for Kubernetes.
