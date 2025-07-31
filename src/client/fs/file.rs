@@ -141,6 +141,10 @@ impl AsyncRead for File {
                     let result = session.read(file_handle, offset, len as u32).await;
 
                     match result {
+                        Ok(data) if data.data.is_empty() => {
+                            // EOF reached, return None
+                            Ok(None)
+                        }
                         Ok(data) => Ok(Some(data.data)),
                         Err(Error::Status(status)) if status.status_code == StatusCode::Eof => {
                             Ok(None)

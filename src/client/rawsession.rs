@@ -41,14 +41,22 @@ impl SessionInner {
         
         if let Some(sender) = self.requests.pin().remove(&id) {
             let validate = if id.is_some() && self.version.is_none() {
-                warn!(packet_id = ?id, "Unexpected packet: received ID when version is none");
+                error!(packet_id = ?id, "Protocol violation: received packet with ID before version negotiation");
                 Err(Error::UnexpectedPacket)
             } else if id.is_none() && self.version.is_some() {
-                warn!("Unexpected behavior: duplicate version");
-                Err(Error::UnexpectedBehavior("Duplicate version".to_owned()))
-            } else {
-                trace!(packet_id = ?id, "Packet validation successful");
+                error!(current_version = ?self.version, "Protocol violation: duplicate version packet");
+                Err(Error::UnexpectedBehavior("Duplicate version packet received".to_owned()))
+            } else if id.is_none() && matches!(packet, Packet::Version(_)) {
+                // Version packet is valid during initial negotiation
+                trace!("Version packet received during negotiation");
                 Ok(())
+            } else if id.is_some() && self.version.is_some() {
+                // Normal packet with ID after version negotiation
+                trace!(packet_id = ?id, version = ?self.version, "Normal packet validation successful");
+                Ok(())
+            } else {
+                error!(packet_id = ?id, version = ?self.version, packet_type = ?packet.packet_type(), "Invalid packet state combination");
+                Err(Error::UnexpectedBehavior("Invalid packet/version state".to_owned()))
             };
 
             match sender.try_send(validate.clone().map(|_| packet)) {
@@ -384,6 +392,17 @@ impl RawSftpSession {
     ) -> SftpResult<Data> {
         let handle_str = handle.into();
         debug!(handle = %handle_str, offset = offset, length = len, "Reading from file");
+        
+        // Validate input parameters
+        if len == 0 {
+            warn!(handle = %handle_str, "Attempted to read zero bytes");
+            return Err(Error::UnexpectedBehavior("Cannot read zero bytes".to_owned()));
+        }
+        
+        if handle_str.is_empty() {
+            error!("Attempted to read with empty handle");
+            return Err(Error::UnexpectedBehavior("Handle cannot be empty".to_owned()));
+        }
         
         if self.options.limits.read_len.is_some_and(|r| len as u64 > r) {
             warn!(
