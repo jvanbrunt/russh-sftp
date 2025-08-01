@@ -22,6 +22,21 @@ pub enum Error {
     /// Occurs due to exceeding the limits set by the `limits@openssh.com` extension
     #[error("Limit exceeded: {0}")]
     Limited(String),
+    /// Specific error for SolarWinds Serv-U server compatibility issues
+    /// 
+    /// This error type is triggered when the client detects error patterns
+    /// commonly associated with SolarWinds Serv-U servers, particularly
+    /// versions 15.3.2 and later which introduced stricter buffer management.
+    /// 
+    /// Common patterns that trigger this error:
+    /// - "Client has exceeded the server's internal buffers"
+    /// - "Too many simultaneous client requests"
+    /// - "Connection reset" during file operations
+    /// - "Non-RFC compliant SSH protocol version exchange"
+    /// - "Buffer overflow" messages
+    /// - "Internal buffer limit" exceeded
+    #[error("Serv-U compatibility error: {0}")]
+    ServUCompatibility(String),
     /// Occurs when an unexpected packet is sent
     #[error("Unexpected packet")]
     UnexpectedPacket,
@@ -32,8 +47,69 @@ pub enum Error {
 
 impl From<Status> for Error {
     fn from(status: Status) -> Self {
-        Self::Status(status)
+        // Check for Serv-U specific error patterns
+        if is_serv_u_error(&status.error_message) {
+            Self::ServUCompatibility(status.error_message.clone())
+        } else {
+            Self::Status(status)
+        }
     }
+}
+
+/// Detects SolarWinds Serv-U specific error patterns
+/// 
+/// This function analyzes error messages to identify patterns commonly associated
+/// with SolarWinds Serv-U servers, particularly compatibility issues introduced
+/// in versions 15.3.2 and later.
+/// 
+/// # SolarWinds Serv-U Error Patterns
+/// 
+/// The function checks for these known Serv-U error patterns:
+/// 
+/// ## Buffer Management Errors
+/// - **"Client has exceeded the server's internal buffers"** - Most common Serv-U error,
+///   typically caused by buffer sizes that exceed internal server limits
+/// - **"Buffer overflow"** - General buffer-related errors
+/// - **"Internal buffer limit"** - Server-side buffer constraints exceeded
+/// 
+/// ## Request Rate Limiting
+/// - **"Too many simultaneous client requests"** - Server rejecting rapid requests,
+///   can be resolved with request throttling
+/// 
+/// ## Connection Issues  
+/// - **"Connection reset"** - Unexpected connection termination during operations,
+///   often related to buffer or protocol issues
+/// 
+/// ## Protocol Compatibility
+/// - **"Non-RFC compliant SSH protocol version exchange"** - Protocol negotiation
+///   issues, particularly with older Java-based SFTP clients
+/// 
+/// # Parameters
+/// 
+/// - `error_message`: The error message string to analyze
+/// 
+/// # Returns
+/// 
+/// Returns `true` if the error message contains patterns associated with Serv-U
+/// compatibility issues, `false` otherwise.
+/// 
+/// # Usage
+/// 
+/// This function is automatically called when converting `Status` errors to
+/// determine if they should be classified as `ServUCompatibility` errors
+/// rather than generic `Status` errors.
+fn is_serv_u_error(error_message: &str) -> bool {
+    let serv_u_patterns = [
+        "Client has exceeded the server's internal buffers",
+        "too many simultaneous client requests",  
+        "connection reset",
+        "non-RFC compliant SSH protocol version exchange",
+        "buffer overflow",
+        "internal buffer limit",
+    ];
+    
+    let lower_message = error_message.to_lowercase();
+    serv_u_patterns.iter().any(|pattern| lower_message.contains(&pattern.to_lowercase()))
 }
 
 impl From<io::Error> for Error {

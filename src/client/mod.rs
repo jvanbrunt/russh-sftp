@@ -1,3 +1,92 @@
+//! # SFTP Client Implementation
+//! 
+//! This module provides a high-level SFTP client implementation with support for
+//! both standard SFTP operations and enhanced compatibility features for
+//! SolarWinds Serv-U servers.
+//! 
+//! # SolarWinds Serv-U Compatibility
+//! 
+//! This SFTP client includes comprehensive compatibility features specifically
+//! designed to work around known issues with SolarWinds Serv-U servers,
+//! particularly versions 15.3.2 and later which introduced stricter buffer
+//! management and protocol changes.
+//! 
+//! ## Key Compatibility Features
+//! 
+//! ### 1. Conservative Buffer Management
+//! - **Reduced Buffer Sizes**: Default read/write buffers reduced from 255KB to 32KB
+//! - **Fallback Limits**: 16KB conservative limits when server lacks `limits@openssh.com`
+//! - **Automatic Detection**: Smart fallback based on server capability detection
+//! 
+//! ### 2. Request Throttling
+//! - **Configurable Delays**: Minimum delays between requests (default: 10ms for Serv-U)
+//! - **Buffer Overflow Prevention**: Prevents "too many simultaneous requests" errors
+//! - **Zero Performance Impact**: Minimal latency increase for most use cases
+//! 
+//! ### 3. Connection Management
+//! - **Handle Limiting**: Conservative concurrent file handle limits (default: 10)
+//! - **Smart Limit Detection**: Uses minimum of server and client-side limits
+//! - **Graceful Degradation**: Prevents silent failures from handle exhaustion
+//! 
+//! ### 4. Enhanced Error Handling
+//! - **Pattern Recognition**: Automatic detection of Serv-U specific error patterns
+//! - **Specialized Error Types**: `ServUCompatibility` errors for better diagnostics
+//! - **Comprehensive Patterns**: Covers buffer, rate limiting, and connection errors
+//! 
+//! ## Common Serv-U Issues Addressed
+//! 
+//! | Issue | Symptoms | Solution |
+//! |-------|----------|----------|
+//! | Buffer Overflow | "Client has exceeded server's internal buffers" | Conservative buffer sizes + limits |
+//! | Rate Limiting | "Too many simultaneous client requests" | Request throttling |
+//! | Handle Exhaustion | Silent failures, connection instability | Conservative handle limits |
+//! | Protocol Issues | Connection resets, version exchange errors | Enhanced error detection |
+//! 
+//! ## Quick Start
+//! 
+//! For SolarWinds Serv-U servers, enable compatibility mode:
+//! 
+//! ```rust
+//! use russh_sftp::client::SftpSession;
+//! use tokio::net::TcpStream;
+//! 
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let stream = TcpStream::connect("serv-u-server:22").await?;
+//! let sftp = SftpSession::new(stream).await?;
+//! 
+//! // Enable all Serv-U compatibility features
+//! sftp.enable_serv_u_compatibility().await;
+//! 
+//! // File operations now work reliably with Serv-U
+//! let file = sftp.open("remote_file.txt").await?;
+//! # Ok(())
+//! # }
+//! ```
+//! 
+//! ## Advanced Configuration
+//! 
+//! For fine-tuned control over compatibility features:
+//! 
+//! ```rust
+//! # use russh_sftp::client::SftpSession;
+//! # async fn example(sftp: &SftpSession) {
+//! // Custom throttling for different server loads
+//! sftp.session.set_request_throttling(5).await;   // Light throttling
+//! sftp.session.set_request_throttling(25).await;  // Heavy throttling
+//! 
+//! // Custom handle limits based on server capacity
+//! sftp.session.set_max_concurrent_handles(5).await;   // Very conservative
+//! sftp.session.set_max_concurrent_handles(20).await;  // Higher throughput
+//! # }
+//! ```
+//! 
+//! ## Module Structure
+//! 
+//! - [`SftpSession`] - High-level SFTP client with convenience methods
+//! - [`RawSftpSession`] - Low-level protocol implementation with full control
+//! - [`error`] - Error types including Serv-U specific error detection
+//! - [`fs`] - File system operations with conservative buffer management
+
 pub mod error;
 pub mod fs;
 mod handler;

@@ -89,6 +89,107 @@ impl SftpSession {
         self.session.set_timeout(secs).await;
     }
 
+    /// Enable all SolarWinds Serv-U compatibility features
+    /// 
+    /// This convenience method enables all compatibility features designed to work
+    /// around known issues with SolarWinds Serv-U servers, particularly versions
+    /// 15.3.2 and later which introduced stricter buffer management.
+    /// 
+    /// # Features Enabled
+    /// 
+    /// This method enables the following compatibility features:
+    /// 
+    /// ## Request Throttling (10ms delay)
+    /// - Adds a minimum 10ms delay between consecutive SFTP requests
+    /// - Prevents "too many simultaneous client requests" errors
+    /// - Reduces buffer overflow errors from rapid request sequences
+    /// 
+    /// ## Conservative Connection Limits (10 handles)
+    /// - Limits concurrent file handles to 10 to prevent buffer exhaustion
+    /// - Works around servers that don't properly advertise handle limits
+    /// - Provides stability under high concurrent load
+    /// 
+    /// ## Automatic Buffer Size Management
+    /// - Uses conservative buffer sizes (16KB) when server lacks limits extension
+    /// - Prevents "Client has exceeded server's internal buffers" errors
+    /// - Automatically applied based on server capabilities
+    /// 
+    /// # SolarWinds Serv-U Compatibility Issues
+    /// 
+    /// SolarWinds Serv-U servers, especially versions 15.3.2 and later, have several
+    /// known compatibility issues that this method addresses:
+    /// 
+    /// - **Buffer Management**: Strict internal buffer limits that aren't properly
+    ///   advertised to clients, leading to buffer overflow errors
+    /// - **Request Rate Limiting**: Poor handling of rapid consecutive requests,
+    ///   causing connection resets and "too many requests" errors  
+    /// - **Handle Management**: Inadequate handle limit reporting, leading to
+    ///   silent failures when limits are exceeded
+    /// - **Protocol Changes**: Updates in 15.3.2+ that affect legacy client compatibility
+    /// 
+    /// # Performance Impact
+    /// 
+    /// Enabling these features introduces minimal performance overhead:
+    /// - **Latency**: ~10ms additional latency per request (usually negligible)
+    /// - **Throughput**: Reduced concurrent operations may slightly impact throughput
+    /// - **Memory**: No significant memory overhead
+    /// - **Reliability**: Significantly improved connection stability and error rates
+    /// 
+    /// For most applications, the reliability improvements far outweigh the minor
+    /// performance impact.
+    /// 
+    /// # Usage Scenarios
+    /// 
+    /// **Recommended for:**
+    /// - Any application connecting to SolarWinds Serv-U servers
+    /// - Production environments where connection stability is critical
+    /// - Applications that perform many concurrent file operations
+    /// - Environments with older or heavily loaded Serv-U installations
+    /// 
+    /// **Consider alternatives for:**
+    /// - High-throughput applications where latency is critical
+    /// - Modern, well-configured SFTP servers that properly advertise limits
+    /// - Servers that are known to work well with standard SFTP clients
+    /// 
+    /// # Example
+    /// 
+    /// ```rust
+    /// use russh_sftp::client::SftpSession;
+    /// use tokio::net::TcpStream;
+    /// 
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let stream = TcpStream::connect("serv-u-server:22").await?;
+    /// let sftp = SftpSession::new(stream).await?;
+    /// 
+    /// // Enable all Serv-U compatibility features
+    /// sftp.enable_serv_u_compatibility().await;
+    /// 
+    /// // Now safe to perform file operations with improved reliability
+    /// let file = sftp.open("remote_file.txt").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    /// 
+    /// # Advanced Configuration
+    /// 
+    /// For fine-tuned control, use the individual methods instead:
+    /// 
+    /// ```rust
+    /// # use russh_sftp::client::SftpSession;
+    /// # use tokio::net::TcpStream;
+    /// # async fn example(sftp: &SftpSession) {
+    /// // Custom throttling - lighter for modern servers
+    /// sftp.session.set_request_throttling(5).await;
+    /// 
+    /// // Custom handle limit - higher for well-configured servers  
+    /// sftp.session.set_max_concurrent_handles(20).await;
+    /// # }
+    /// ```
+    pub async fn enable_serv_u_compatibility(&self) {
+        self.session.enable_serv_u_throttling().await;
+        self.session.enable_serv_u_connection_limits().await;
+    }
+
     /// Closes the inner channel stream.
     pub async fn close(&self) -> SftpResult<()> {
         self.session.close_session()

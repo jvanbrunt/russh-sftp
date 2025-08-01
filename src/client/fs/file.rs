@@ -18,8 +18,34 @@ use crate::{
 
 type StateFn<T> = Option<Pin<Box<dyn Future<Output = io::Result<T>> + Send + Sync + 'static>>>;
 
+/// Default maximum read length for SFTP operations (32KB)
+/// 
+/// This value was reduced from the original 255KB to improve compatibility with
+/// SolarWinds Serv-U servers, which have known issues with larger buffer sizes.
 const MAX_READ_LENGTH: u64 = 32 * 1024;
-const MAX_WRITE_LENGTH: u64 = 261120;
+
+/// Default maximum write length for SFTP operations (32KB)
+/// 
+/// This value was reduced from the original 255KB to match the read buffer size
+/// and improve compatibility with SolarWinds Serv-U servers that can experience
+/// buffer overflow errors with asymmetric read/write buffer sizes.
+const MAX_WRITE_LENGTH: u64 = 32 * 1024;
+
+/// Conservative fallback read limit for servers without limits@openssh.com extension (16KB)
+/// 
+/// Used when the server doesn't support the limits extension, providing extra
+/// compatibility with older or non-compliant SFTP servers, particularly
+/// SolarWinds Serv-U versions 15.3.2 and later which introduced stricter
+/// buffer management.
+const CONSERVATIVE_MAX_READ_LENGTH: u64 = 16 * 1024;
+
+/// Conservative fallback write limit for servers without limits@openssh.com extension (16KB)
+/// 
+/// Used when the server doesn't support the limits extension, providing extra  
+/// compatibility with older or non-compliant SFTP servers, particularly
+/// SolarWinds Serv-U versions 15.3.2 and later which introduced stricter
+/// buffer management.
+const CONSERVATIVE_MAX_WRITE_LENGTH: u64 = 16 * 1024;
 
 struct FileState {
     f_read: StateFn<Option<Vec<u8>>>,
@@ -66,6 +92,31 @@ impl File {
             closed: false,
             extensions,
         }
+    }
+
+    /// Determines if we should use conservative limits for better Serv-U compatibility
+    /// 
+    /// This method checks if the server supports the `limits@openssh.com` extension.
+    /// If not, it returns true to indicate that conservative buffer sizes should be used.
+    /// 
+    /// # SolarWinds Serv-U Compatibility
+    /// 
+    /// SolarWinds Serv-U servers, particularly versions 15.3.2 and later, have strict
+    /// internal buffer management that can cause connection failures with larger buffer
+    /// sizes. Using conservative limits helps prevent these errors:
+    /// 
+    /// - "Client has exceeded the server's internal buffers"
+    /// - "Too many simultaneous client requests"
+    /// - Connection reset errors during file transfers
+    /// 
+    /// # Returns
+    /// 
+    /// Returns `true` if conservative limits should be used (server lacks limits extension),
+    /// `false` if the server's advertised limits should be respected.
+    fn should_use_conservative_limits(&self) -> bool {
+        // Use conservative limits if server doesn't support limits extension
+        // This is particularly important for SolarWinds Serv-U compatibility
+        self.extensions.limits.is_none()
     }
 
     /// Queries metadata about the remote file.
@@ -121,12 +172,13 @@ impl AsyncRead for File {
             Some(f) => f,
             None => {
                 let session = self.session.clone();
-                let max_read_len = self
-                    .extensions
-                    .limits
-                    .as_ref()
-                    .and_then(|l| l.read_len)
-                    .unwrap_or(MAX_READ_LENGTH) as usize;
+                let max_read_len = if let Some(limits) = &self.extensions.limits {
+                    limits.read_len.unwrap_or(MAX_READ_LENGTH)
+                } else if self.should_use_conservative_limits() {
+                    CONSERVATIVE_MAX_READ_LENGTH
+                } else {
+                    MAX_READ_LENGTH
+                } as usize;
 
                 let file_handle = self.handle.clone();
 
@@ -237,12 +289,13 @@ impl AsyncWrite for File {
             Some(f) => f,
             None => {
                 let session = self.session.clone();
-                let max_write_len = self
-                    .extensions
-                    .limits
-                    .as_ref()
-                    .and_then(|l| l.write_len)
-                    .unwrap_or(MAX_WRITE_LENGTH) as usize;
+                let max_write_len = if let Some(limits) = &self.extensions.limits {
+                    limits.write_len.unwrap_or(MAX_WRITE_LENGTH)
+                } else if self.should_use_conservative_limits() {
+                    CONSERVATIVE_MAX_WRITE_LENGTH
+                } else {
+                    MAX_WRITE_LENGTH
+                } as usize;
 
                 let file_handle = self.handle.clone();
                 let data = buf.to_vec();

@@ -10,7 +10,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{mpsc, RwLock},
-    time,
+    time::{self, sleep, Instant},
 };
 use tracing::{debug, error, info, trace, warn};
 
@@ -147,9 +147,39 @@ impl From<LimitsExtension> for Limits {
     }
 }
 
+/// Internal options structure for SFTP session configuration
+/// 
+/// This structure holds various configuration options for the SFTP session,
+/// including timeout settings, server limits, and compatibility features
+/// specifically designed for SolarWinds Serv-U servers.
 pub(crate) struct Options {
+    /// Response timeout in seconds
     timeout: RwLock<u64>,
+    /// Server-advertised limits from limits@openssh.com extension
     limits: Arc<Limits>,
+    
+    // === SolarWinds Serv-U Compatibility Features ===
+    
+    /// Last request timestamp for throttling implementation
+    /// 
+    /// Used to enforce minimum delays between SFTP requests to prevent
+    /// "too many simultaneous client requests" errors in Serv-U servers.
+    last_request_time: RwLock<Option<Instant>>,
+    
+    /// Minimum delay between requests in milliseconds
+    /// 
+    /// When set to a non-zero value, enforces a minimum delay between
+    /// consecutive SFTP requests. This helps prevent buffer overflow
+    /// errors in SolarWinds Serv-U servers that have strict internal
+    /// buffer management.
+    request_delay_ms: RwLock<u64>,
+    
+    /// Conservative maximum concurrent file handles limit
+    /// 
+    /// Provides an additional layer of handle limiting beyond server-advertised
+    /// limits. Particularly useful for Serv-U servers which may not properly
+    /// advertise their internal handle limits, leading to buffer overflow errors.
+    max_concurrent_handles: RwLock<Option<u64>>,
 }
 
 /// Implements raw work with the protocol in request-response format.
@@ -203,6 +233,9 @@ impl RawSftpSession {
             options: Options {
                 timeout: RwLock::new(10),
                 limits: Arc::new(Limits::default()),
+                last_request_time: RwLock::new(None),
+                request_delay_ms: RwLock::new(0), // 0 = no throttling by default
+                max_concurrent_handles: RwLock::new(None), // None = use server limits
             },
         }
     }
@@ -218,8 +251,169 @@ impl RawSftpSession {
         self.options.limits = limits;
     }
 
+    /// Enable request throttling for SolarWinds Serv-U compatibility
+    /// 
+    /// Sets a minimum 10ms delay between consecutive SFTP requests to prevent
+    /// buffer overflow errors that commonly occur with SolarWinds Serv-U servers.
+    /// 
+    /// # SolarWinds Serv-U Compatibility
+    /// 
+    /// Serv-U servers, particularly versions 15.3.2 and later, have strict internal
+    /// buffer management. Without throttling, rapid consecutive requests can trigger:
+    /// 
+    /// - "Client has exceeded the server's internal buffers"
+    /// - "Too many simultaneous client requests"
+    /// - Unexpected connection resets
+    /// 
+    /// # Performance Impact
+    /// 
+    /// The 10ms delay introduces minimal latency for most use cases while significantly
+    /// improving reliability with Serv-U servers. For high-throughput scenarios,
+    /// consider using `set_request_throttling()` with a smaller delay.
+    /// 
+    /// # Example
+    /// 
+    /// ```rust
+    /// # use russh_sftp::client::RawSftpSession;
+    /// # async fn example(session: &RawSftpSession) {
+    /// session.enable_serv_u_throttling().await;
+    /// # }
+    /// ```
+    pub async fn enable_serv_u_throttling(&self) {
+        *self.options.request_delay_ms.write().await = 10; // 10ms delay between requests
+    }
+
+    /// Set custom request throttling delay in milliseconds
+    /// 
+    /// Configures a custom minimum delay between consecutive SFTP requests.
+    /// This is useful for fine-tuning performance vs. compatibility trade-offs
+    /// with different SFTP servers.
+    /// 
+    /// # Parameters
+    /// 
+    /// - `delay_ms`: Minimum delay in milliseconds between requests (0 = no throttling)
+    /// 
+    /// # Recommended Values
+    /// 
+    /// - **0ms**: No throttling (default) - use for standard compliant servers
+    /// - **5-10ms**: Light throttling - good balance for most Serv-U installations  
+    /// - **15-25ms**: Heavy throttling - use for older or heavily loaded Serv-U servers
+    /// - **50ms+**: Extreme throttling - use only for severely problematic servers
+    /// 
+    /// # Example
+    /// 
+    /// ```rust
+    /// # use russh_sftp::client::RawSftpSession;
+    /// # async fn example(session: &RawSftpSession) {
+    /// // Light throttling for modern Serv-U servers
+    /// session.set_request_throttling(5).await;
+    /// 
+    /// // Heavy throttling for problematic servers
+    /// session.set_request_throttling(20).await;
+    /// 
+    /// // Disable throttling
+    /// session.set_request_throttling(0).await;
+    /// # }
+    /// ```
+    pub async fn set_request_throttling(&self, delay_ms: u64) {
+        *self.options.request_delay_ms.write().await = delay_ms;
+    }
+
+    /// Enable conservative connection limits for SolarWinds Serv-U compatibility
+    /// 
+    /// Sets a conservative limit of 10 concurrent file handles to prevent buffer
+    /// overflow errors in SolarWinds Serv-U servers that may not properly advertise
+    /// their internal handle limits.
+    /// 
+    /// # SolarWinds Serv-U Compatibility
+    /// 
+    /// Many Serv-U servers don't support the `limits@openssh.com` extension or
+    /// advertise incorrect limits. This can lead to:
+    /// 
+    /// - Silent handle exhaustion without proper error reporting
+    /// - Buffer overflow errors when internal limits are exceeded
+    /// - Connection instability under high concurrent load
+    /// 
+    /// The conservative limit of 10 handles provides a safe operating range for
+    /// most Serv-U installations while maintaining reasonable performance.
+    /// 
+    /// # Interaction with Server Limits
+    /// 
+    /// This method sets a client-side limit that operates independently of and
+    /// in addition to any server-advertised limits. The effective limit will be
+    /// the minimum of:
+    /// - Server-advertised limit (if available)
+    /// - Conservative client-side limit (10)
+    /// 
+    /// # Example
+    /// 
+    /// ```rust
+    /// # use russh_sftp::client::RawSftpSession;
+    /// # async fn example(session: &RawSftpSession) {
+    /// session.enable_serv_u_connection_limits().await;
+    /// # }
+    /// ```
+    pub async fn enable_serv_u_connection_limits(&self) {
+        *self.options.max_concurrent_handles.write().await = Some(10); // Conservative limit
+    }
+
+    /// Set custom maximum concurrent handle limit
+    /// 
+    /// Configures a custom client-side limit for concurrent file handles.
+    /// This limit operates in addition to any server-advertised limits.
+    /// 
+    /// # Parameters
+    /// 
+    /// - `max_handles`: Maximum number of concurrent file handles to allow
+    /// 
+    /// # Recommended Values
+    /// 
+    /// - **5-10**: Very conservative - use for older or heavily loaded Serv-U servers
+    /// - **10-20**: Balanced - good for most Serv-U installations
+    /// - **20-50**: Higher throughput - use only with well-configured modern servers
+    /// - **50+**: High performance - use only with servers that properly advertise limits
+    /// 
+    /// # Example
+    /// 
+    /// ```rust
+    /// # use russh_sftp::client::RawSftpSession;
+    /// # async fn example(session: &RawSftpSession) {
+    /// // Very conservative for problematic servers
+    /// session.set_max_concurrent_handles(5).await;
+    /// 
+    /// // Balanced approach
+    /// session.set_max_concurrent_handles(15).await;
+    /// 
+    /// // Higher performance for modern servers
+    /// session.set_max_concurrent_handles(30).await;
+    /// # }
+    /// ```
+    pub async fn set_max_concurrent_handles(&self, max_handles: u64) {
+        *self.options.max_concurrent_handles.write().await = Some(max_handles);
+    }
+
     async fn send(&self, id: Option<u32>, packet: Packet) -> SftpResult<Packet> {
         debug!(request_id = ?id, packet_type = ?packet.packet_type(), "Sending packet");
+        
+        // Implement request throttling for Serv-U compatibility
+        let delay_ms = *self.options.request_delay_ms.read().await;
+        if delay_ms > 0 {
+            let now = Instant::now();
+            let mut last_time = self.options.last_request_time.write().await;
+            
+            if let Some(last) = *last_time {
+                let elapsed = now.duration_since(last);
+                let required_delay = Duration::from_millis(delay_ms);
+                
+                if elapsed < required_delay {
+                    let sleep_duration = required_delay - elapsed;
+                    trace!("Throttling request: sleeping for {}ms", sleep_duration.as_millis());
+                    sleep(sleep_duration).await;
+                }
+            }
+            
+            *last_time = Some(now);
+        }
         
         if self.tx.is_closed() {
             error!("Cannot send packet: session closed");
@@ -306,18 +500,29 @@ impl RawSftpSession {
         let filename_str = filename.into();
         debug!(request_id = ?self.next_req_id.load(Ordering::SeqCst), filename = %filename_str, flags = ?flags, "Opening file");
         
-        if self
-            .options
-            .limits
-            .open_handles
-            .is_some_and(|h| self.handles.load(Ordering::SeqCst) >= h)
-        {
-            warn!(
-                current_handles = self.handles.load(Ordering::SeqCst),
-                max_handles = ?self.options.limits.open_handles,
-                "Handle limit reached"
-            );
-            return Err(Error::Limited("handle limit reached".to_owned()));
+        // Check both server limits and conservative limits for Serv-U compatibility
+        let current_handles = self.handles.load(Ordering::SeqCst);
+        let server_limit = self.options.limits.open_handles;
+        let conservative_limit = *self.options.max_concurrent_handles.read().await;
+        
+        let effective_limit = match (server_limit, conservative_limit) {
+            (Some(server), Some(conservative)) => Some(server.min(conservative)),
+            (Some(server), None) => Some(server),
+            (None, Some(conservative)) => Some(conservative),
+            (None, None) => None,
+        };
+        
+        if let Some(limit) = effective_limit {
+            if current_handles >= limit {
+                warn!(
+                    current_handles = current_handles,
+                    server_limit = ?server_limit,
+                    conservative_limit = ?conservative_limit,
+                    effective_limit = limit,
+                    "Handle limit reached (Serv-U compatibility)"
+                );
+                return Err(Error::Limited("handle limit reached".to_owned()));
+            }
         }
 
         let id = self.use_next_id();
@@ -566,13 +771,22 @@ impl RawSftpSession {
     }
 
     pub async fn opendir<P: Into<String>>(&self, path: P) -> SftpResult<Handle> {
-        if self
-            .options
-            .limits
-            .open_handles
-            .is_some_and(|h| self.handles.load(Ordering::SeqCst) >= h)
-        {
-            return Err(Error::Limited("Handle limit reached".to_owned()));
+        // Check both server limits and conservative limits for Serv-U compatibility
+        let current_handles = self.handles.load(Ordering::SeqCst);
+        let server_limit = self.options.limits.open_handles;
+        let conservative_limit = *self.options.max_concurrent_handles.read().await;
+        
+        let effective_limit = match (server_limit, conservative_limit) {
+            (Some(server), Some(conservative)) => Some(server.min(conservative)),
+            (Some(server), None) => Some(server),
+            (None, Some(conservative)) => Some(conservative),
+            (None, None) => None,
+        };
+        
+        if let Some(limit) = effective_limit {
+            if current_handles >= limit {
+                return Err(Error::Limited("Handle limit reached".to_owned()));
+            }
         }
 
         let id = self.use_next_id();
