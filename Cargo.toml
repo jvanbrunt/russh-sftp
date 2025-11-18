@@ -31,7 +31,7 @@ bytes = "1.10"
 flurry = "0.5"
 
 [dev-dependencies]
-russh = "0.53.0"
+russh = "0.54.6"
 anyhow = "1.0"
 criterion = { version = "0.5", features = ["async_tokio"] }
 futures = "0.3"

@@ -637,7 +637,12 @@ impl RawSftpSession {
                 trace!(request_id = id, data_length = data.data.len(), "Read operation successful");
             }
             Packet::Status(status) => {
-                warn!(request_id = id, status_code = ?status.status_code, error = %status.error_message, "Read operation failed");
+                // EOF is a normal condition when reading files, not an error
+                if status.status_code == StatusCode::Eof {
+                    trace!(request_id = id, "Read reached end of file");
+                } else {
+                    warn!(request_id = id, status_code = ?status.status_code, error = %status.error_message, "Read operation failed");
+                }
             }
             _ => {
                 error!(request_id = id, packet_type = ?result.packet_type(), "Unexpected packet received for read operation");
