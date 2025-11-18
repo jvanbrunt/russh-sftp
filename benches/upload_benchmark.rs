@@ -62,7 +62,7 @@ async fn test_upload_data(sftp: SftpSession, file_count: i32, file_size: i32) {
 async fn upload_file(file_count: i32, file_size: i32) {
     let config = russh::client::Config::default();
     let sh = Client {};
-    let mut session = russh::client::connect(Arc::new(config), ("localhost", 22), sh)
+    let mut session = russh::client::connect(Arc::new(config), ("localhost", 2222), sh)
         .await
         .unwrap();
     if session

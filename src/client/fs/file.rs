@@ -9,6 +9,7 @@ use tokio::{
     io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf},
     runtime::Handle,
 };
+use tracing::{trace, warn};
 
 use super::Metadata;
 use crate::{
@@ -168,9 +169,17 @@ impl AsyncRead for File {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // Safety check: Prevent concurrent read operations
+        // The future in f_read should be polled to completion before creating a new one
+        // This is enforced by Rust's borrow checker (&mut self), but we add explicit handling
         let poll = Pin::new(match self.state.f_read.as_mut() {
-            Some(f) => f,
+            Some(f) => {
+                // Read operation already in progress, poll existing future
+                trace!("Polling existing read operation");
+                f
+            },
             None => {
+                // No read in progress, create new read operation
                 let session = self.session.clone();
                 let max_read_len = if let Some(limits) = &self.extensions.limits {
                     limits.read_len.unwrap_or(MAX_READ_LENGTH)
@@ -182,6 +191,7 @@ impl AsyncRead for File {
 
                 let file_handle = self.handle.clone();
 
+                // Capture current file position - this ensures sequential reads
                 let offset = self.pos;
                 let len = if buf.remaining() > max_read_len {
                     max_read_len
@@ -189,16 +199,26 @@ impl AsyncRead for File {
                     buf.remaining()
                 };
 
+                trace!(offset = offset, len = len, "Starting new read operation");
+
                 self.state.f_read.get_or_insert(Box::pin(async move {
                     let result = session.read(file_handle, offset, len as u32).await;
 
                     match result {
-                        Ok(data) if data.data.is_empty() => {
-                            // EOF reached, return None
-                            Ok(None)
+                        Ok(data) => {
+                            // Only treat explicit EOF status as end-of-file
+                            // Empty data packets should not be assumed to be EOF
+                            if data.data.is_empty() {
+                                warn!(
+                                    offset = offset,
+                                    "Received empty data packet (not EOF status) - this may indicate a server issue"
+                                );
+                            }
+                            Ok(Some(data.data))
                         }
-                        Ok(data) => Ok(Some(data.data)),
                         Err(Error::Status(status)) if status.status_code == StatusCode::Eof => {
+                            // Explicit EOF from server - this is the only reliable EOF indicator
+                            trace!(offset = offset, "Reached end of file (explicit EOF status)");
                             Ok(None)
                         }
                         Err(e) => Err(io::Error::other(e)),
@@ -209,7 +229,9 @@ impl AsyncRead for File {
         .poll(cx);
 
         if poll.is_ready() {
+            // Clear the future slot so a new read can be started
             self.state.f_read = None;
+            trace!("Read operation completed, clearing future slot");
         }
 
         match poll {

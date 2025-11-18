@@ -71,12 +71,12 @@
 //! # use russh_sftp::client::SftpSession;
 //! # async fn example(sftp: &SftpSession) {
 //! // Custom throttling for different server loads
-//! sftp.session.set_request_throttling(5).await;   // Light throttling
-//! sftp.session.set_request_throttling(25).await;  // Heavy throttling
-//! 
+//! sftp.set_request_throttling(5).await;   // Light throttling
+//! sftp.set_request_throttling(25).await;  // Heavy throttling
+//!
 //! // Custom handle limits based on server capacity
-//! sftp.session.set_max_concurrent_handles(5).await;   // Very conservative
-//! sftp.session.set_max_concurrent_handles(20).await;  // Higher throughput
+//! sftp.set_max_concurrent_handles(5).await;   // Very conservative
+//! sftp.set_max_concurrent_handles(20).await;  // Higher throughput
 //! # }
 //! ```
 //! 
@@ -90,10 +90,12 @@
 pub mod error;
 pub mod fs;
 mod handler;
+pub mod metrics;
 pub mod rawsession;
 mod session;
 
 pub use handler::Handler;
+pub use metrics::{ConnectionState, Metrics, MetricsSnapshot};
 pub use rawsession::RawSftpSession;
 pub use session::SftpSession;
 

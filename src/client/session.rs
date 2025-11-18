@@ -179,15 +179,67 @@ impl SftpSession {
     /// # use tokio::net::TcpStream;
     /// # async fn example(sftp: &SftpSession) {
     /// // Custom throttling - lighter for modern servers
-    /// sftp.session.set_request_throttling(5).await;
-    /// 
-    /// // Custom handle limit - higher for well-configured servers  
-    /// sftp.session.set_max_concurrent_handles(20).await;
+    /// sftp.set_request_throttling(5).await;
+    ///
+    /// // Custom handle limit - higher for well-configured servers
+    /// sftp.set_max_concurrent_handles(20).await;
     /// # }
     /// ```
     pub async fn enable_serv_u_compatibility(&self) {
         self.session.enable_serv_u_throttling().await;
         self.session.enable_serv_u_connection_limits().await;
+    }
+
+    /// Set custom request throttling delay in milliseconds
+    ///
+    /// See [`RawSftpSession::set_request_throttling`] for details.
+    pub async fn set_request_throttling(&self, delay_ms: u64) {
+        self.session.set_request_throttling(delay_ms).await;
+    }
+
+    /// Set maximum number of concurrent file handles
+    ///
+    /// See [`RawSftpSession::set_max_concurrent_handles`] for details.
+    pub async fn set_max_concurrent_handles(&self, max_handles: u64) {
+        self.session.set_max_concurrent_handles(max_handles).await;
+    }
+
+    /// Set maximum number of retry attempts
+    ///
+    /// See [`RawSftpSession::set_max_retries`] for details.
+    pub async fn set_max_retries(&self, max_retries: u32) {
+        self.session.set_max_retries(max_retries).await;
+    }
+
+    /// Set initial retry delay in milliseconds
+    ///
+    /// See [`RawSftpSession::set_retry_delay`] for details.
+    pub async fn set_retry_delay(&self, delay_ms: u64) {
+        self.session.set_retry_delay(delay_ms).await;
+    }
+
+    /// Get current connection health state
+    ///
+    /// See [`RawSftpSession::connection_state`] for details.
+    pub async fn connection_state(&self) -> super::metrics::ConnectionState {
+        self.session.connection_state().await
+    }
+
+    /// Get a snapshot of current session metrics
+    ///
+    /// See [`RawSftpSession::metrics`] for details.
+    pub async fn metrics(&self) -> super::metrics::MetricsSnapshot {
+        self.session.metrics().await
+    }
+
+    /// Gracefully shut down the SFTP session
+    ///
+    /// See [`RawSftpSession::graceful_shutdown`] for details.
+    pub async fn graceful_shutdown(self, timeout_secs: u64) -> SftpResult<bool> {
+        Arc::try_unwrap(self.session)
+            .map_err(|_| Error::UnexpectedBehavior("Cannot shutdown: session has multiple references".into()))?
+            .graceful_shutdown(timeout_secs)
+            .await
     }
 
     /// Closes the inner channel stream.

@@ -14,7 +14,7 @@ use tokio::{
 };
 use tracing::{debug, error, info, trace, warn};
 
-use super::{error::Error, run, Handler};
+use super::{error::Error, metrics::Metrics, run, Handler};
 use crate::{
     de,
     extensions::{
@@ -175,11 +175,34 @@ pub(crate) struct Options {
     request_delay_ms: RwLock<u64>,
     
     /// Conservative maximum concurrent file handles limit
-    /// 
+    ///
     /// Provides an additional layer of handle limiting beyond server-advertised
     /// limits. Particularly useful for Serv-U servers which may not properly
     /// advertise their internal handle limits, leading to buffer overflow errors.
     max_concurrent_handles: RwLock<Option<u64>>,
+
+    // === Retry and Reliability Features ===
+
+    /// Maximum number of retry attempts for failed operations
+    ///
+    /// When a request times out or fails with a transient error, the client
+    /// will retry up to this many times with exponential backoff before
+    /// giving up. Set to 0 to disable retries.
+    max_retries: RwLock<u32>,
+
+    /// Initial delay in milliseconds for retry exponential backoff
+    ///
+    /// The first retry will wait this amount, second retry will wait 2x,
+    /// third retry will wait 4x, etc. Default is 100ms.
+    retry_initial_delay_ms: RwLock<u64>,
+
+    // === Observability Features ===
+
+    /// Request metrics and connection health monitoring
+    ///
+    /// Tracks request latency, error rates, retry counts, and connection health.
+    /// Provides observability into SFTP session performance and reliability.
+    metrics: Arc<Metrics>,
 }
 
 /// Implements raw work with the protocol in request-response format.
@@ -236,6 +259,9 @@ impl RawSftpSession {
                 last_request_time: RwLock::new(None),
                 request_delay_ms: RwLock::new(0), // 0 = no throttling by default
                 max_concurrent_handles: RwLock::new(None), // None = use server limits
+                max_retries: RwLock::new(3), // Default: 3 retry attempts
+                retry_initial_delay_ms: RwLock::new(100), // Default: 100ms initial delay
+                metrics: Arc::new(Metrics::new()),
             },
         }
     }
@@ -392,62 +418,326 @@ impl RawSftpSession {
         *self.options.max_concurrent_handles.write().await = Some(max_handles);
     }
 
+    /// Set maximum number of retry attempts for failed operations
+    ///
+    /// When a request times out or fails with a transient error, the client
+    /// will retry up to this many times with exponential backoff before giving up.
+    ///
+    /// # Parameters
+    ///
+    /// - `max_retries`: Maximum number of retry attempts (0 = no retries)
+    ///
+    /// # Default
+    ///
+    /// Default is 3 retries, providing good reliability without excessive delays.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use russh_sftp::client::RawSftpSession;
+    /// # async fn example(session: &RawSftpSession) {
+    /// // Disable retries for fast-fail behavior
+    /// session.set_max_retries(0).await;
+    ///
+    /// // Aggressive retries for unreliable networks
+    /// session.set_max_retries(5).await;
+    /// # }
+    /// ```
+    pub async fn set_max_retries(&self, max_retries: u32) {
+        *self.options.max_retries.write().await = max_retries;
+    }
+
+    /// Set initial delay for retry exponential backoff
+    ///
+    /// Configures the base delay used for exponential backoff when retrying
+    /// failed operations. The actual delay doubles with each retry attempt:
+    /// 1st retry: initial_delay_ms, 2nd: 2x, 3rd: 4x, etc.
+    ///
+    /// # Parameters
+    ///
+    /// - `delay_ms`: Initial delay in milliseconds
+    ///
+    /// # Default
+    ///
+    /// Default is 100ms, providing quick recovery without overwhelming the server.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use russh_sftp::client::RawSftpSession;
+    /// # async fn example(session: &RawSftpSession) {
+    /// // Fast retries for low-latency networks
+    /// session.set_retry_delay(50).await;
+    ///
+    /// // Slower retries for congested networks
+    /// session.set_retry_delay(500).await;
+    /// # }
+    /// ```
+    pub async fn set_retry_delay(&self, delay_ms: u64) {
+        *self.options.retry_initial_delay_ms.write().await = delay_ms;
+    }
+
+    /// Get current connection health state
+    ///
+    /// Returns the current health status of the SFTP connection based on
+    /// error rates and request patterns.
+    ///
+    /// # Connection States
+    ///
+    /// - `Connecting`: Initial state, negotiating connection
+    /// - `Healthy`: Connection is working normally (< 10% error rate)
+    /// - `Degraded`: Connection is experiencing issues (> 10% error rate)
+    /// - `Disconnected`: Connection has been closed
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use russh_sftp::client::{RawSftpSession, ConnectionState};
+    /// # async fn example(session: &RawSftpSession) {
+    /// let state = session.connection_state().await;
+    /// match state {
+    ///     ConnectionState::Healthy => println!("Connection is healthy"),
+    ///     ConnectionState::Degraded => println!("Connection is degraded, consider reconnecting"),
+    ///     ConnectionState::Disconnected => println!("Connection lost"),
+    ///     ConnectionState::Connecting => println!("Still connecting"),
+    /// }
+    /// # }
+    /// ```
+    pub async fn connection_state(&self) -> super::metrics::ConnectionState {
+        self.options.metrics.connection_state().await
+    }
+
+    /// Get a snapshot of current session metrics
+    ///
+    /// Returns detailed metrics including:
+    /// - Request counts (total, successful, failed, retried)
+    /// - Active request count
+    /// - Error counts by type (timeout, I/O, protocol)
+    /// - Latency percentiles (P50, P95, P99)
+    /// - Connection state and success rate
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use russh_sftp::client::RawSftpSession;
+    /// # async fn example(session: &RawSftpSession) {
+    /// let metrics = session.metrics().await;
+    /// println!("Success rate: {:.1}%", metrics.success_rate);
+    /// println!("Active requests: {}", metrics.active_requests);
+    /// if let Some(p99) = metrics.latency_p99_ms {
+    ///     println!("P99 latency: {}ms", p99);
+    /// }
+    /// # }
+    /// ```
+    pub async fn metrics(&self) -> super::metrics::MetricsSnapshot {
+        self.options.metrics.snapshot().await
+    }
+
+    /// Gracefully shut down the SFTP session
+    ///
+    /// Waits for all pending requests to complete (up to timeout), then closes
+    /// the session. This is preferred over `close_session()` as it ensures
+    /// no requests are interrupted.
+    ///
+    /// # Parameters
+    ///
+    /// - `timeout`: Maximum time to wait for pending requests (in seconds)
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(true)`: Session closed gracefully, all requests completed
+    /// - `Ok(false)`: Session closed but some requests may have been interrupted
+    /// - `Err(_)`: Error closing session
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use russh_sftp::client::RawSftpSession;
+    /// # async fn example(session: RawSftpSession) -> Result<(), Box<dyn std::error::Error>> {
+    /// // Wait up to 30 seconds for pending requests to complete
+    /// let graceful = session.graceful_shutdown(30).await?;
+    /// if graceful {
+    ///     println!("All requests completed successfully");
+    /// } else {
+    ///     println!("Some requests may have been interrupted");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn graceful_shutdown(self, timeout_secs: u64) -> SftpResult<bool> {
+        info!("Starting graceful shutdown (timeout: {}s)", timeout_secs);
+
+        // Mark connection as disconnected
+        self.options.metrics.set_connection_state(super::metrics::ConnectionState::Disconnected).await;
+
+        // Wait for active requests to complete
+        let start = Instant::now();
+        let timeout_duration = Duration::from_secs(timeout_secs);
+
+        loop {
+            let metrics = self.options.metrics.snapshot().await;
+            let active = metrics.active_requests;
+
+            if active == 0 {
+                info!("All requests completed, closing session");
+                self.close_session()?;
+                return Ok(true);
+            }
+
+            if start.elapsed() >= timeout_duration {
+                warn!(
+                    active_requests = active,
+                    "Graceful shutdown timeout reached, forcing close"
+                );
+                self.close_session()?;
+                return Ok(false);
+            }
+
+            trace!(active_requests = active, "Waiting for requests to complete");
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Determines if an error is retryable (transient) or permanent
+    fn is_retryable_error(error: &Error) -> bool {
+        match error {
+            // Timeout errors are retryable
+            Error::Timeout => true,
+            // Serv-U compatibility errors may be transient
+            Error::ServUCompatibility(_) => true,
+            // Channel send errors might be temporary
+            Error::UnexpectedBehavior(msg) if msg.contains("recv none message") => true,
+            // Protocol errors and other issues are not retryable
+            _ => false,
+        }
+    }
+
     async fn send(&self, id: Option<u32>, packet: Packet) -> SftpResult<Packet> {
+        let max_retries = *self.options.max_retries.read().await;
+        let retry_delay_ms = *self.options.retry_initial_delay_ms.read().await;
+
         debug!(request_id = ?id, packet_type = ?packet.packet_type(), "Sending packet");
-        
-        // Implement request throttling for Serv-U compatibility
-        let delay_ms = *self.options.request_delay_ms.read().await;
-        if delay_ms > 0 {
-            let now = Instant::now();
-            let mut last_time = self.options.last_request_time.write().await;
-            
-            if let Some(last) = *last_time {
-                let elapsed = now.duration_since(last);
-                let required_delay = Duration::from_millis(delay_ms);
-                
-                if elapsed < required_delay {
-                    let sleep_duration = required_delay - elapsed;
-                    trace!("Throttling request: sleeping for {}ms", sleep_duration.as_millis());
-                    sleep(sleep_duration).await;
+
+        // Start tracking this request
+        let request_handle = self.options.metrics.record_request_start();
+
+        // Serialize packet once before retry loop (Packet doesn't implement Clone)
+        let packet_bytes = Bytes::try_from(packet)?;
+
+        let mut attempt = 0u32;
+
+        loop {
+            if attempt > 0 {
+                // Record retry attempt
+                self.options.metrics.record_retry();
+                // Calculate exponential backoff delay: initial_delay * 2^(attempt-1)
+                let backoff_multiplier = 1u64 << (attempt - 1); // 2^(attempt-1)
+                let delay = Duration::from_millis(retry_delay_ms * backoff_multiplier);
+
+                info!(
+                    request_id = ?id,
+                    attempt = attempt,
+                    max_retries = max_retries,
+                    delay_ms = delay.as_millis(),
+                    "Retrying failed request after delay"
+                );
+
+                sleep(delay).await;
+            }
+
+            // Implement request throttling for Serv-U compatibility
+            let delay_ms = *self.options.request_delay_ms.read().await;
+            if delay_ms > 0 {
+                let now = Instant::now();
+                let mut last_time = self.options.last_request_time.write().await;
+
+                if let Some(last) = *last_time {
+                    let elapsed = now.duration_since(last);
+                    let required_delay = Duration::from_millis(delay_ms);
+
+                    if elapsed < required_delay {
+                        let sleep_duration = required_delay - elapsed;
+                        trace!("Throttling request: sleeping for {}ms", sleep_duration.as_millis());
+                        sleep(sleep_duration).await;
+                    }
+                }
+
+                *last_time = Some(now);
+            }
+
+            if self.tx.is_closed() {
+                error!("Cannot send packet: session closed");
+                return Err(Error::UnexpectedBehavior("session closed".into()));
+            }
+
+            let (tx, mut rx) = mpsc::channel(1);
+
+            self.requests.pin().insert(id, tx);
+
+            match self.tx.send(packet_bytes.clone()) {
+                Ok(_) => trace!(request_id = ?id, attempt = attempt, "Packet successfully queued for sending"),
+                Err(e) => {
+                    error!(request_id = ?id, error = ?e, attempt = attempt, "Failed to send packet");
+                    // Clean up handler on send failure
+                    self.requests.pin().remove(&id);
+                    let error = Error::from(e);
+
+                    // Check if we should retry
+                    if Self::is_retryable_error(&error) && attempt < max_retries {
+                        attempt += 1;
+                        continue;
+                    }
+
+                    return Err(error);
                 }
             }
-            
-            *last_time = Some(now);
-        }
-        
-        if self.tx.is_closed() {
-            error!("Cannot send packet: session closed");
-            return Err(Error::UnexpectedBehavior("session closed".into()));
-        }
 
-        let (tx, mut rx) = mpsc::channel(1);
+            let timeout = *self.options.timeout.read().await;
+            trace!(request_id = ?id, timeout_secs = timeout, attempt = attempt, "Waiting for response");
 
-        self.requests.pin().insert(id, tx);
-        match self.tx.send(Bytes::try_from(packet)?) {
-            Ok(_) => trace!(request_id = ?id, "Packet successfully queued for sending"),
-            Err(e) => {
-                error!(request_id = ?id, error = ?e, "Failed to send packet");
-                return Err(e.into());
-            }
-        }
+            match time::timeout(Duration::from_secs(timeout), rx.recv()).await {
+                Ok(Some(result)) => {
+                    if attempt > 0 {
+                        info!(request_id = ?id, attempt = attempt, "Request succeeded after retry");
+                    }
+                    trace!(request_id = ?id, response_type = ?result.as_ref().map(|p| p.packet_type()), "Response received");
 
-        let timeout = *self.options.timeout.read().await;
-        trace!(request_id = ?id, timeout_secs = timeout, "Waiting for response");
+                    // Record success
+                    request_handle.record_success().await;
+                    return result;
+                },
+                Ok(None) => {
+                    warn!(request_id = ?id, attempt = attempt, "Received None message instead of packet");
+                    self.requests.pin().remove(&id);
+                    let error = Error::UnexpectedBehavior("recv none message".into());
 
-        match time::timeout(Duration::from_secs(timeout), rx.recv()).await {
-            Ok(Some(result)) => {
-                trace!(request_id = ?id, response_type = ?result.as_ref().map(|p| p.packet_type()), "Response received");
-                result
-            },
-            Ok(None) => {
-                warn!(request_id = ?id, "Received None message instead of packet");
-                self.requests.pin().remove(&id);
-                Err(Error::UnexpectedBehavior("recv none message".into()))
-            }
-            Err(error) => {
-                warn!(request_id = ?id, error = ?error, "Request timed out");
-                self.requests.pin().remove(&id);
-                Err(error.into())
+                    // Check if we should retry
+                    if Self::is_retryable_error(&error) && attempt < max_retries {
+                        attempt += 1;
+                        continue;
+                    }
+
+                    // Record failure
+                    request_handle.record_failure();
+                    self.options.metrics.record_error("protocol", error.to_string()).await;
+                    return Err(error);
+                }
+                Err(timeout_error) => {
+                    warn!(request_id = ?id, error = ?timeout_error, attempt = attempt, "Request timed out");
+                    self.requests.pin().remove(&id);
+                    let error = Error::from(timeout_error);
+
+                    // Check if we should retry
+                    if Self::is_retryable_error(&error) && attempt < max_retries {
+                        attempt += 1;
+                        continue;
+                    }
+
+                    // Record failure
+                    request_handle.record_failure();
+                    self.options.metrics.record_error("timeout", error.to_string()).await;
+                    return Err(error);
+                }
             }
         }
     }

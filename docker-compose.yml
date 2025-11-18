@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  sftp-server:
+    image: atmoz/sftp:latest
+    ports:
+      - "2222:22"
+    # User format: username:password:uid:gid:directory
+    # Creates user 'root' with password 'password' and upload directory
+    command: root:password:1001:1001:upload
+    volumes:
+      - sftp-data:/home/root/upload
+    environment:
+      # Ensure the server is ready
+      - SFTP_USERS=root:password:1001:1001:upload
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "22"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  sftp-data:
+    driver: local
